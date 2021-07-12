@@ -5,8 +5,6 @@ import torch
 from torch import device
 from torch.nn import functional as F
 
-from detectron2.utils.env import TORCH_VERSION
-
 
 def _as_tensor(x: Tuple[int, int]) -> torch.Tensor:
     """
@@ -29,7 +27,8 @@ class ImageList(object):
     and storing in a field the original sizes of each image
 
     Attributes:
-        image_sizes (list[tuple[int, int]]): each tuple is (h, w)
+        image_sizes (list[tuple[int, int]]): each tuple is (h, w).
+            During tracing, it becomes list[Tensor] instead.
     """
 
     def __init__(self, tensor: torch.Tensor, image_sizes: List[Tuple[int, int]]):
@@ -73,7 +72,7 @@ class ImageList(object):
     ) -> "ImageList":
         """
         Args:
-            tensors: a tuple or list of `torch.Tensors`, each of shape (Hi, Wi) or
+            tensors: a tuple or list of `torch.Tensor`, each of shape (Hi, Wi) or
                 (C_1, ..., C_K, Hi, Wi) where K >= 1. The Tensors will be padded
                 to the same shape with `pad_value`.
             size_divisibility (int): If `size_divisibility > 0`, add padding to ensure
@@ -88,7 +87,7 @@ class ImageList(object):
         assert isinstance(tensors, (tuple, list))
         for t in tensors:
             assert isinstance(t, torch.Tensor), type(t)
-            assert t.shape[1:-2] == tensors[0].shape[1:-2], t.shape
+            assert t.shape[:-2] == tensors[0].shape[:-2], t.shape
 
         image_sizes = [(im.shape[-2], im.shape[-1]) for im in tensors]
         image_sizes_tensor = [_as_tensor(x) for x in image_sizes]
@@ -103,8 +102,7 @@ class ImageList(object):
         if torch.jit.is_scripting():
             max_size: List[int] = max_size.to(dtype=torch.long).tolist()
         else:
-            # https://github.com/pytorch/pytorch/issues/42448
-            if TORCH_VERSION >= (1, 7) and torch.jit.is_tracing():
+            if torch.jit.is_tracing():
                 image_sizes = image_sizes_tensor
 
         if len(tensors) == 1:

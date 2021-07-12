@@ -7,14 +7,17 @@ import logging
 import os
 import tempfile
 import time
+import warnings
 from collections import Counter
 import torch
 from fvcore.common.checkpoint import PeriodicCheckpointer as _PeriodicCheckpointer
+from fvcore.common.param_scheduler import ParamScheduler
 from fvcore.common.timer import Timer
 from fvcore.nn.precise_bn import get_bn_modules, update_bn_stats
 
 import detectron2.utils.comm as comm
 from detectron2.evaluation.testing import flatten_results_dict
+from detectron2.solver import LRMultiplier
 from detectron2.utils.events import EventStorage, EventWriter
 from detectron2.utils.file_io import PathManager
 
@@ -29,6 +32,7 @@ __all__ = [
     "AutogradProfiler",
     "EvalHook",
     "PreciseBN",
+    "TorchProfiler",
 ]
 
 
@@ -206,14 +210,25 @@ class LRScheduler(HookBase):
     def __init__(self, optimizer=None, scheduler=None):
         """
         Args:
-            No args needed. Will obtain optimizer and scheduler from trainer.
+            optimizer (torch.optim.Optimizer):
+            scheduler (torch.optim.LRScheduler or fvcore.common.param_scheduler.ParamScheduler):
+                if a :class:`ParamScheduler` object, it defines the multiplier over the base LR
+                in the optimizer.
+
+        If any argument is not given, will try to obtain it from the trainer.
         """
         self._optimizer = optimizer
         self._scheduler = scheduler
 
     def before_train(self):
         self._optimizer = self._optimizer or self.trainer.optimizer
-        self._scheduler = self._scheduler or self.trainer.scheduler
+        if isinstance(self.scheduler, ParamScheduler):
+            self._scheduler = LRMultiplier(
+                self._optimizer,
+                self.scheduler,
+                self.trainer.max_iter,
+                last_iter=self.trainer.iter - 1,
+            )
 
         # NOTE: some heuristics on what LR to summarize
         # summarize the param group with most parameters
@@ -237,17 +252,110 @@ class LRScheduler(HookBase):
     def after_step(self):
         lr = self._optimizer.param_groups[self._best_param_group_id]["lr"]
         self.trainer.storage.put_scalar("lr", lr, smoothing_hint=False)
-        self._scheduler.step()
+        self.scheduler.step()
+
+    @property
+    def scheduler(self):
+        return self._scheduler or self.trainer.scheduler
+
+    def state_dict(self):
+        if isinstance(self.scheduler, torch.optim.lr_scheduler._LRScheduler):
+            return self.scheduler.state_dict()
+        return {}
+
+    def load_state_dict(self, state_dict):
+        if isinstance(self.scheduler, torch.optim.lr_scheduler._LRScheduler):
+            logger = logging.getLogger(__name__)
+            logger.info("Loading scheduler from state_dict ...")
+            self.scheduler.load_state_dict(state_dict)
 
 
-class AutogradProfiler(HookBase):
+class TorchProfiler(HookBase):
+    """
+    A hook which runs `torch.profiler.profile`.
+
+    Examples:
+    ::
+        hooks.TorchProfiler(
+             lambda trainer: 10 < trainer.iter < 20, self.cfg.OUTPUT_DIR
+        )
+
+    The above example will run the profiler for iteration 10~20 and dump
+    results to ``OUTPUT_DIR``. We did not profile the first few iterations
+    because they are typically slower than the rest.
+    The result files can be loaded in the ``chrome://tracing`` page in chrome browser,
+    and the tensorboard visualizations can be visualized using
+    ``tensorboard --logdir OUTPUT_DIR/log``
+    """
+
+    def __init__(self, enable_predicate, output_dir, *, activities=None, save_tensorboard=True):
+        """
+        Args:
+            enable_predicate (callable[trainer -> bool]): a function which takes a trainer,
+                and returns whether to enable the profiler.
+                It will be called once every step, and can be used to select which steps to profile.
+            output_dir (str): the output directory to dump tracing files.
+            activities (iterable): same as in `torch.profiler.profile`.
+            save_tensorboard (bool): whether to save tensorboard visualizations at (output_dir)/log/
+        """
+        self._enable_predicate = enable_predicate
+        self._activities = activities
+        self._output_dir = output_dir
+        self._save_tensorboard = save_tensorboard
+
+    def before_step(self):
+        if self._enable_predicate(self.trainer):
+            if self._save_tensorboard:
+                on_trace_ready = torch.profiler.tensorboard_trace_handler(
+                    os.path.join(
+                        self._output_dir,
+                        "log",
+                        "profiler-tensorboard-iter{}".format(self.trainer.iter),
+                    )
+                )
+            else:
+                on_trace_ready = None
+            self._profiler = torch.profiler.profile(
+                activities=self._activities,
+                on_trace_ready=on_trace_ready,
+                record_shapes=True,
+                profile_memory=True,
+                with_stack=True,
+                with_flops=True,
+            )
+            self._profiler.__enter__()
+        else:
+            self._profiler = None
+
+    def after_step(self):
+        if self._profiler is None:
+            return
+        self._profiler.__exit__(None, None, None)
+        PathManager.mkdirs(self._output_dir)
+        out_file = os.path.join(
+            self._output_dir, "profiler-trace-iter{}.json".format(self.trainer.iter)
+        )
+        if "://" not in out_file:
+            self._profiler.export_chrome_trace(out_file)
+        else:
+            # Support non-posix filesystems
+            with tempfile.TemporaryDirectory(prefix="detectron2_profiler") as d:
+                tmp_file = os.path.join(d, "tmp.json")
+                self._profiler.export_chrome_trace(tmp_file)
+                with open(tmp_file) as f:
+                    content = f.read()
+            with PathManager.open(out_file, "w") as f:
+                f.write(content)
+
+
+class AutogradProfiler(TorchProfiler):
     """
     A hook which runs `torch.autograd.profiler.profile`.
 
     Examples:
     ::
         hooks.AutogradProfiler(
-             lambda trainer: trainer.iter > 10 and trainer.iter < 20, self.cfg.OUTPUT_DIR
+             lambda trainer: 10 < trainer.iter < 20, self.cfg.OUTPUT_DIR
         )
 
     The above example will run the profiler for iteration 10~20 and dump
@@ -272,6 +380,7 @@ class AutogradProfiler(HookBase):
             output_dir (str): the output directory to dump tracing files.
             use_cuda (bool): same as in `torch.autograd.profiler.profile`.
         """
+        warnings.warn("AutogradProfiler has been deprecated in favor of TorchProfiler.")
         self._enable_predicate = enable_predicate
         self._use_cuda = use_cuda
         self._output_dir = output_dir
@@ -282,26 +391,6 @@ class AutogradProfiler(HookBase):
             self._profiler.__enter__()
         else:
             self._profiler = None
-
-    def after_step(self):
-        if self._profiler is None:
-            return
-        self._profiler.__exit__(None, None, None)
-        PathManager.mkdirs(self._output_dir)
-        out_file = os.path.join(
-            self._output_dir, "profiler-trace-iter{}.json".format(self.trainer.iter)
-        )
-        if "://" not in out_file:
-            self._profiler.export_chrome_trace(out_file)
-        else:
-            # Support non-posix filesystems
-            with tempfile.TemporaryDirectory(prefix="detectron2_profiler") as d:
-                tmp_file = os.path.join(d, "tmp.json")
-                self._profiler.export_chrome_trace(tmp_file)
-                with open(tmp_file) as f:
-                    content = f.read()
-            with PathManager.open(out_file, "w") as f:
-                f.write(content)
 
 
 class EvalHook(HookBase):
@@ -353,7 +442,9 @@ class EvalHook(HookBase):
     def after_step(self):
         next_iter = self.trainer.iter + 1
         if self._period > 0 and next_iter % self._period == 0:
-            self._do_eval()
+            # do the last eval in after_train
+            if next_iter != self.trainer.max_iter:
+                self._do_eval()
 
     def after_train(self):
         # This condition is to prevent the eval from running after a failed training
